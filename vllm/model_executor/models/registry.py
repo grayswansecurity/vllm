@@ -116,6 +116,7 @@ _EMBEDDING_MODELS = {
         k: (mod, arch) for k, (mod, arch) in _TEXT_GENERATION_MODELS.items()
         if arch == "LlamaForCausalLM"
     },
+    "LlamaForSequenceClassification": ("llama", "LlamaForSequenceClassification"),
     "MistralModel": ("llama", "LlamaForCausalLM"),
     "Phi3ForCausalLM": ("phi3", "Phi3ForCausalLM"),
     "Qwen2Model": ("qwen2", "Qwen2EmbeddingModel"),

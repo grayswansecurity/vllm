@@ -436,6 +436,11 @@ Classification
     - :code:`jason9693/Qwen2.5-1.5B-apeach`, etc.
     - ✅︎
     - ✅︎
+  * - :code:`LlamaForSequenceClassification`
+    - Llama-based
+    - :code:`HuggingFaceH4/tiny-random-LlamaForSequenceClassification`, etc.
+    - ✅︎
+    - ✅︎
 
 .. note::
     As an interim measure, these models are supported in both offline and online inference via Embeddings API.
