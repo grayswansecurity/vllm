@@ -670,8 +670,6 @@ class LlamaForSequenceClassification(nn.Module, SupportsLoRA, SupportsPP):
         self.model = LlamaModel(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"))
 
-        # hidden_states from LlamaModel has been reduced,
-        # the input of score layer is not parallelized.
         self.score = RowParallelLinear(config.hidden_size,
                                        config.num_labels,
                                        quant_config=quant_config,
@@ -682,7 +680,7 @@ class LlamaForSequenceClassification(nn.Module, SupportsLoRA, SupportsPP):
             pooler_config,
             pooling_type=PoolingType.LAST,
             normalize=False,
-            softmax=True)
+            softmax=False)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -714,3 +712,141 @@ class LlamaForSequenceClassification(nn.Module, SupportsLoRA, SupportsPP):
         loader = AutoWeightsLoader(self,
                                    ignore_unexpected_prefixes=["lm_head."])
         return loader.load_weights(weights)
+
+class LlamaForCausalLMAndClassification(nn.Module, SupportsLoRA, SupportsPP):
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"]
+    }
+
+    # LoRA specific attributes
+    supported_lora_modules = [
+        "qkv_proj", "o_proj", "gate_up_proj", "down_proj", "embed_tokens",
+        "lm_head"
+    ]
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings"
+    }
+    embedding_padding_modules = ["lm_head"]
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
+        
+        self.config = config
+        self.lora_config = lora_config
+
+        # Shared LLaMA backbone
+        self.model = LlamaModel(vllm_config=vllm_config,
+                                prefix=maybe_prefix(prefix, "llama"))
+
+        # LM head for causal language modeling
+        if get_pp_group().is_last_rank:
+            self.unpadded_vocab_size = config.vocab_size
+            if lora_config:
+                self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+            self.lm_head = ParallelLMHead(
+                self.unpadded_vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                padding_size=(DEFAULT_VOCAB_PADDING_SIZE if not lora_config 
+                            else lora_config.lora_vocab_padding_size),
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            if config.tie_word_embeddings:
+                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+
+            self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
+                                                    config.vocab_size,
+                                                    getattr(config, "logit_scale", 1.0))
+            self.sampler = get_sampler()
+        else:
+            self.lm_head = PPMissingLayer()
+
+        # Classification head
+        self.score = RowParallelLinear(config.hidden_size,
+                                        config.num_labels,
+                                        quant_config=quant_config,
+                                        input_is_parallel=False,
+                                        bias=False,
+                                        prefix=maybe_prefix(prefix, "score"))
+        
+        # Initialize pooler with default settings directly
+        self._pooler = Pooler(
+            pooling_type=PoolingType.LAST,  # Default to LAST pooling
+            normalize=False,
+            softmax=False
+        )
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        lm_outputs: bool = False,
+        cls_outputs: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        # Get hidden states from backbone
+        hidden_states = self.model(input_ids, positions, kv_caches,
+                                 attn_metadata, intermediate_tensors,
+                                 inputs_embeds)
+        print("hidden_states", hidden_states)
+        if not lm_outputs and not cls_outputs:
+            return hidden_states
+        
+        out_dict = {}
+        
+        # LM logits if requested
+        if lm_outputs:
+            logits = self.logits_processor(self.lm_head, hidden_states,
+                                         attn_metadata.sampling_metadata)
+            out_dict['lm_logits'] = logits
+            print("lm_logits", logits)
+        # Classification logits if requested
+        if cls_outputs:
+            cls_logits, _ = self.score(hidden_states)
+            out_dict['cls_logits'] = cls_logits
+            print("cls_logits", cls_logits)
+        return out_dict
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                     sampling_metadata)
+        return logits
+
+    def sample(
+        self, 
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata
+    ) -> Optional[SamplerOutput]:
+        next_tokens = self.sampler(logits, sampling_metadata)
+        return next_tokens
+
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Set[str]:
+        # Create loader with proper ignore patterns
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."] if self.config.tie_word_embeddings else None,
+            ignore_unexpected_prefixes=["llama", "model", "layers"]  # Add these prefixes to ignore
+        )
+        loader.load_weights(weights)
