@@ -750,6 +750,7 @@ class LlamaForSequenceClassification(nn.Module, SupportsLoRA, SupportsPP):
             inputs_embeds,
         )
         logits, _ = self.score(hidden_states)
+        hidden_states = torch.nn.functional.normalize(hidden_states, dim=-1)
         full_embeddings = torch.cat((logits, hidden_states), dim=-1)
         return full_embeddings
 
