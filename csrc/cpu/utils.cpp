@@ -1,12 +1,29 @@
-#include <numa.h>
-#include <unistd.h>
-#include <string>
-#include <sched.h>
+#ifndef VLLM_NUMA_DISABLED
+  #include <numa.h>
+  #include <unistd.h>
+  #include <string>
+  #include <sched.h>
+#endif
+#if __GLIBC__ == 2 && __GLIBC_MINOR__ < 30
+  #include <unistd.h>
+  #include <sys/syscall.h>
+  #define gettid() syscall(SYS_gettid)
+#endif
 
 #include "cpu_types.hpp"
 
+#ifdef VLLM_NUMA_DISABLED
 std::string init_cpu_threads_env(const std::string& cpu_ids) {
-  bitmask* omp_cpu_mask = numa_parse_cpustring(cpu_ids.c_str());
+  return std::string(
+      "Warning: NUMA is not enabled in this build. `init_cpu_threads_env` has "
+      "no effect to setup thread affinity.");
+}
+
+#endif
+
+#ifndef VLLM_NUMA_DISABLED
+std::string init_cpu_threads_env(const std::string& cpu_ids) {
+  bitmask* omp_cpu_mask = numa_parse_cpustring_all(cpu_ids.c_str());
   TORCH_CHECK(omp_cpu_mask->size > 0);
   std::vector<int> omp_cpu_ids;
   omp_cpu_ids.reserve(omp_cpu_mask->size);
@@ -37,8 +54,7 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
     *(src_mask->maskp) = *(src_mask->maskp) ^ *(mask->maskp);
     int page_num = numa_migrate_pages(pid, src_mask, mask);
     if (page_num == -1) {
-      TORCH_CHECK(false,
-                  "numa_migrate_pages failed. errno: " + std::to_string(errno));
+      TORCH_WARN("numa_migrate_pages failed. errno: " + std::to_string(errno));
     }
 
     // restrict memory allocation node.
@@ -57,7 +73,7 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
   omp_lock_t writelock;
   omp_init_lock(&writelock);
 
-#pragma omp parallel for schedule(static, 1)
+  #pragma omp parallel for schedule(static, 1)
   for (size_t i = 0; i < omp_cpu_ids.size(); ++i) {
     cpu_set_t mask;
     CPU_ZERO(&mask);
@@ -88,3 +104,4 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
 
   return ss.str();
 }
+#endif

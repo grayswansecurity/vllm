@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Test the piecewise compilation with a simple model so that we
 can exactly calculate the expected output and side effects.
@@ -11,6 +13,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (CompilationConfig, CompilationLevel, VllmConfig,
                          set_current_vllm_config)
+from vllm.envs import VLLM_USE_V1
 from vllm.utils import direct_register_custom_op
 
 global_counter = 0
@@ -73,11 +76,13 @@ class SillyModel(nn.Module):
         return x
 
 
-def test_simple_piecewise_compile():
+def _test_simple_piecewise_compile(*, use_inductor):
+    assert VLLM_USE_V1
 
     vllm_config = VllmConfig(compilation_config=CompilationConfig(
         level=CompilationLevel.PIECEWISE,
         use_cudagraph=True,
+        use_inductor=use_inductor,
         splitting_ops=["silly.attention"],
         cudagraph_copy_inputs=True,
         cudagraph_capture_sizes=[1, 2],
@@ -91,8 +96,8 @@ def test_simple_piecewise_compile():
             num_graphs_seen=1,  # one graph for the model
             num_piecewise_graphs_seen=5,  # 2 * num_layers + 1
             num_piecewise_capturable_graphs_seen=3,  # 1 + num_layers
-            num_inductor_compilations=3,  # num_piecewise_capturable_graphs_seen
-            num_cudagraph_caputured=
+            num_backend_compilations=3,  # num_piecewise_capturable_graphs_seen
+            num_cudagraph_captured=
             6,  # num_cudagraph_sizes * num_piecewise_capturable_graphs_seen
     ):
 
@@ -107,3 +112,11 @@ def test_simple_piecewise_compile():
         output = model(input)
         assert global_counter == 2
         assert torch.allclose(output.cpu(), torch.tensor([3., 1.]))
+
+
+def test_simple_piecewise_compile_inductor():
+    _test_simple_piecewise_compile(use_inductor=True)
+
+
+def test_simple_piecewise_compile_no_inductor():
+    _test_simple_piecewise_compile(use_inductor=False)

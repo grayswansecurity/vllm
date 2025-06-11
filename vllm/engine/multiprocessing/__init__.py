@@ -1,8 +1,10 @@
-from dataclasses import dataclass
-from enum import Enum
-from typing import List, Mapping, Optional, Union, overload
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing_extensions import deprecated
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Mapping, Optional, Union
 
 from vllm import PoolingParams
 from vllm.inputs import PromptType
@@ -10,7 +12,7 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
-from vllm.utils import deprecate_kwargs
+from vllm.utils import Device
 
 VLLM_RPC_SUCCESS_STR = "SUCCESS"
 
@@ -34,22 +36,6 @@ class RPCProcessRequest:
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
     priority: int = 0
 
-    @overload
-    @deprecated("'inputs' will be renamed to 'prompt")
-    def __init__(
-        self,
-        *,
-        inputs: PromptType,
-        params: Union[SamplingParams, PoolingParams],
-        request_id: str,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        priority: int = 0,
-    ) -> None:
-        ...
-
-    @overload
     def __init__(
         self,
         prompt: PromptType,
@@ -60,29 +46,6 @@ class RPCProcessRequest:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
     ) -> None:
-        ...
-
-    @deprecate_kwargs(
-        "inputs",
-        additional_message="Please use the 'prompt' parameter instead.",
-    )
-    def __init__(
-            self,
-            prompt: Optional[PromptType] = None,
-            params: Optional[Union[SamplingParams, PoolingParams]] = None,
-            request_id: Optional[str] = None,
-            lora_request: Optional[LoRARequest] = None,
-            trace_headers: Optional[Mapping[str, str]] = None,
-            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-            priority: int = 0,
-            *,
-            inputs: Optional[PromptType] = None,  # DEPRECATED
-    ) -> None:
-        if inputs is not None:
-            prompt = inputs
-        assert (prompt is not None and params is not None
-                and request_id is not None)
-
         super().__init__()
 
         self.prompt = prompt
@@ -120,10 +83,57 @@ class RPCUProfileRequest(Enum):
     STOP_PROFILE = 2
 
 
-RPC_REQUEST_T = Union[RPCProcessRequest, RPCAbortRequest, RPCStartupRequest,
-                      RPCUProfileRequest]
+class RPCResetMultiModalCacheRequest(Enum):
+    RESET = 1
 
-REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCError]
+
+@dataclass
+class RPCResetPrefixCacheRequest:
+    device: Device
+
+
+class RPCSleepRequest(Enum):
+    SLEEP_LEVEL_1 = 1
+    SLEEP_LEVEL_2 = 2
+
+
+@dataclass
+class RPCWakeUpRequest:
+    tags: Optional[list[str]] = None
+
+
+@dataclass
+class RPCIsSleepingRequest:
+    # Set the default value of request_id to a new UUID
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
+@dataclass
+class RPCIsSleepingResponse:
+    request_id: str
+    is_sleeping: bool
+
+
+@dataclass
+class RPCLoadAdapterRequest:
+    lora_request: LoRARequest
+    # Set the default value of request_id to a new UUID
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
+@dataclass
+class RPCAdapterLoadedResponse:
+    request_id: str
+
+
+RPC_REQUEST_T = Union[RPCProcessRequest, RPCAbortRequest, RPCStartupRequest,
+                      RPCUProfileRequest, RPCLoadAdapterRequest,
+                      RPCResetMultiModalCacheRequest,
+                      RPCResetPrefixCacheRequest, RPCSleepRequest,
+                      RPCWakeUpRequest, RPCIsSleepingRequest]
+
+REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCAdapterLoadedResponse,
+                          RPCIsSleepingResponse, RPCError]
 
 
 def ENGINE_DEAD_ERROR(

@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A CPU worker class."""
-from typing import Dict, List, Optional, Tuple, Type
+import os
+from importlib import util
+from typing import Dict, List, Optional, Set, Tuple, Type
 
 import torch
 import torch.distributed
@@ -11,14 +15,14 @@ from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment)
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.sequence import ExecuteModelRequest
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, bind_kv_cache
 from vllm.worker.cpu_enc_dec_model_runner import CPUEncoderDecoderModelRunner
 from vllm.worker.cpu_model_runner import CPUModelRunner, CPUModelRunnerBase
 from vllm.worker.cpu_pooling_model_runner import CPUPoolingModelRunner
-from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
-                                     LoraNotSupportedWorkerBase, WorkerBase,
+from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
 
 logger = init_logger(__name__)
@@ -52,8 +56,11 @@ class CPUCacheEngine:
 
         if cache_config.cache_dtype == "auto":
             self.dtype = model_config.dtype
+        elif cache_config.cache_dtype in ["fp8", "fp8_e5m2"]:
+            self.dtype = torch.float8_e5m2
         else:
-            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            raise NotImplementedError(f"Unsupported KV cache type "
+                                      f"{cache_config.cache_dtype}.")
 
         # Get attention backend.
         self.attn_backend = get_attn_backend(
@@ -62,6 +69,7 @@ class CPUCacheEngine:
             cache_config.cache_dtype,
             self.block_size,
             self.model_config.is_attention_free,
+            use_mla=self.model_config.use_mla,
         )
 
         # Initialize the cache.
@@ -101,7 +109,7 @@ class CPUCacheEngine:
         num_layers = model_config.get_num_layers(parallel_config)
 
         key_cache_block = block_size * num_heads * head_size
-        value_cache_block = key_cache_block
+        value_cache_block = key_cache_block if not model_config.use_mla else 0
         total = num_layers * (key_cache_block + value_cache_block)
         if cache_dtype == "auto":
             dtype = model_config.dtype
@@ -111,7 +119,7 @@ class CPUCacheEngine:
         return dtype_size * total
 
 
-class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
+class CPUWorker(LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a CPU socket.
 
     Each worker is associated with a single CPU socket. The worker is 
@@ -134,6 +142,8 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         self.local_rank = local_rank
         self.rank = rank
+        vllm_config.parallel_config.rank = rank
+
         self.distributed_init_method = distributed_init_method
 
         self.is_driver_worker = is_driver_worker
@@ -147,8 +157,10 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         # Setup OpenMP threads affinity.
         omp_cpuids = envs.VLLM_CPU_OMP_THREADS_BIND
-        if omp_cpuids == "all":
-            self.local_omp_cpuid = "all"
+        self.local_omp_cpuid = "all"
+        if omp_cpuids == "auto":
+            self.local_omp_cpuid = self.get_cpus_id_binding_based_on_numa_nodes(
+            )
         else:
             self.local_omp_cpuid = omp_cpuids.split("|")[rank]
 
@@ -163,7 +175,7 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                 not in ["medusa", "mlp_speculator", "eagle"]) \
                     else {"return_hidden_states": True}
         ModelRunnerClass: Type[CPUModelRunnerBase] = CPUModelRunner
-        if self.model_config.task == "embedding":
+        if self.model_config.runner_type == "pooling":
             ModelRunnerClass = CPUPoolingModelRunner
         elif self.model_config.is_encoder_decoder:
             ModelRunnerClass = CPUEncoderDecoderModelRunner
@@ -178,7 +190,7 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: List[CPUCacheEngine]
-        # Initialize cpu_cache as embedding models don't initialize kv_caches
+        # Initialize cpu_cache as pooling models don't initialize kv_caches
         self.cpu_cache: Optional[List[List[torch.Tensor]]] = None
 
         # Torch profiler. Enabled and configured through env vars:
@@ -212,6 +224,10 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             ret = torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
             if ret:
                 logger.info(ret)
+
+        # Note: unique identifier for creating allreduce shared memory
+        os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(
+            ":")[-1]
         self.device = torch.device("cpu")
         self.init_distributed_environment()
         # Set random seed.
@@ -266,6 +282,18 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # Initialize the cache.
         self._init_cache_engine()
 
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_runner.add_lora(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.model_runner.remove_lora(lora_id)
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return self.model_runner.pin_lora(lora_id)
+
+    def list_loras(self) -> Set[int]:
+        return self.model_runner.list_loras()
+
     def _validate_num_cpu_blocks(self, num_cpu_blocks: int) -> None:
         """Raise errors if the num_cpu_blocks is invalid.
         """
@@ -293,6 +321,8 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             self.cache_engine[ve].cpu_cache
             for ve in range(self.parallel_config.pipeline_parallel_size)
         ]
+        bind_kv_cache(self.compilation_config.static_forward_context,
+                      self.cpu_cache)
         self.model_runner.block_size = self.cache_engine[0].block_size
 
         assert all(
@@ -333,9 +363,8 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     def prepare_worker_input(
             self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
         assert execute_model_req is not None
-        virtual_engine = execute_model_req.virtual_engine
+        virtual_engine: int = execute_model_req.virtual_engine
         num_seq_groups: int = len(execute_model_req.seq_group_metadata_list)
-        blocks_to_copy = execute_model_req.blocks_to_copy
         blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
                                       device="cpu",
                                       dtype=torch.int64).view(-1, 2)
@@ -373,3 +402,49 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         return CPUCacheEngine.get_cache_block_size(
             self.cache_config.block_size, self.cache_config.cache_dtype,
             self.model_config, self.parallel_config)
+
+    def get_cpus_id_binding_based_on_numa_nodes(self) -> str:
+        """Return CPUs id binding based on NUMA nodes.
+        """
+        rank_to_cpus = self.local_omp_cpuid
+        # Setup OpenMP thread affinity based on NUMA nodes automatically
+        world_size = self.vllm_config.parallel_config.world_size
+        libnuma_found = util.find_spec("numa") is not None
+        psutil_found = util.find_spec("psutil") is not None
+        if libnuma_found and psutil_found:
+            import psutil
+            from numa import info
+            cpu_count = psutil.cpu_count(logical=False)
+            cpus_allow_list = psutil.Process().cpu_affinity()
+            numa_size = info.get_num_configured_nodes()
+            cpu_count_per_numa = cpu_count // numa_size
+            num_of_reserved_cpu = min(envs.VLLM_CPU_NUM_OF_RESERVED_CPU,
+                                      cpu_count_per_numa // 2)
+
+            # check allow node_to_cpus list
+            node_to_cpus = []
+            for i in range(numa_size):
+                node_intersect = set(
+                    info.node_to_cpus(i)).intersection(cpus_allow_list)
+                if bool(node_intersect):
+                    node_to_cpus.append(list(node_intersect))
+
+            if world_size > len(node_to_cpus):
+                logger.error(
+                    "Auto thread-binding failed due to "
+                    "world size: %d is larger than "
+                    "allowed NUMA nodes number: %d."
+                    "Please try to bind threads manually.", world_size,
+                    len(node_to_cpus))
+            else:
+                end = cpu_count_per_numa - num_of_reserved_cpu
+                rank_to_cpus_list = node_to_cpus[self.rank][:end]
+                rank_to_cpus = ','.join(str(x) for x in rank_to_cpus_list)
+                logger.info("auto thread-binding list: %s", rank_to_cpus)
+        else:
+            logger.warning(
+                "Auto thread-binding is not supported due to "
+                "the lack of package numa and psutil,"
+                "fallback to no thread-binding. To get better performance,"
+                "please try to manually bind threads.")
+        return rank_to_cpus
